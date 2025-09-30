@@ -28,13 +28,16 @@
 
 This document specifies the networking layer for payload chunking, building upon [Gloas networking](../../gloas/p2p-interface.md).
 
+Chunks and Chunk Access Lists (CALs) propagate as separate sidecars on distinct gossip topics.
+
 ## Configuration
 
 | Name | Value | Description |
 | ---- | ----- | ----------- |
-| `EXECUTION_CHUNK_SUBNET_COUNT` | `8` | Number of execution chunk subnets |
-| `CHUNK_ACCESS_LIST_SUBNET_COUNT` | `4` | Number of chunk access list subnets |
+| `EXECUTION_CHUNK_SUBNET_COUNT` | `16` | Number of execution chunk subnets |
+| `CHUNK_ACCESS_LIST_SUBNET_COUNT` | `16` | Number of chunk access list subnets |
 | `MAX_REQUEST_CHUNKS` | `128` | Maximum chunks in a single request |
+| `MAX_REQUEST_CHUNK_ACCESS_LISTS` | `128` | Maximum CALs in a single request |
 
 ## Containers
 
@@ -75,27 +78,27 @@ Modified validations:
 This topic is used to propagate execution chunk sidecars, where each chunk index maps to some `subnet_id`.
 
 ```python
-def compute_subnet_for_chunk_sidecar(chunk_index: uint64) -> uint64:
-    return chunk_index % EXECUTION_CHUNK_SUBNET_COUNT
+def compute_subnet_for_chunk_sidecar(chunk_index: uint8) -> uint64:
+    return chunk_index % EXECUTION_CHUNK_SUBNET_COUNT  # chunk_index % 16
 ```
 
-The following validations MUST pass before forwarding the `chunk_sidecar` on the network, assuming the alias `block_header = chunk_sidecar.signed_block_header.message`:
+The following validations MUST pass before forwarding the `chunk_sidecar` on the network, assuming the alias `block_header = chunk_sidecar.chunk_signature.message`:
 
-- _[REJECT]_ The sidecar's index is consistent with `MAX_CHUNKS_PER_BLOCK` -- i.e. `chunk_sidecar.index < MAX_CHUNKS_PER_BLOCK`
-- _[REJECT]_ The sidecar is for the correct subnet -- i.e. `compute_subnet_for_chunk_sidecar(chunk_sidecar.index) == subnet_id`
+- _[REJECT]_ The chunk index is consistent with `MAX_CHUNKS_PER_BLOCK` -- i.e. `chunk_sidecar.chunk.chunk_header.index < MAX_CHUNKS_PER_BLOCK`
+- _[REJECT]_ The sidecar is for the correct subnet -- i.e. `compute_subnet_for_chunk_sidecar(chunk_sidecar.chunk.chunk_header.index) == subnet_id`
 - _[IGNORE]_ The sidecar is not from a future slot (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. validate that `block_header.slot <= current_slot`
 - _[IGNORE]_ The sidecar is from a slot greater than the latest finalized slot -- i.e. validate that `block_header.slot > compute_start_slot_at_epoch(store.finalized_checkpoint.epoch)`
-- _[REJECT]_ The proposer signature of `chunk_sidecar.signed_block_header` is valid with respect to the `block_header.proposer_index` pubkey
+- _[REJECT]_ The proposer signature of `chunk_sidecar.chunk_signature` is valid with respect to the `block_header.proposer_index` pubkey
 - _[IGNORE]_ The sidecar's block's parent (defined by `block_header.parent_root`) has been seen
 - _[REJECT]_ The sidecar's block's parent (defined by `block_header.parent_root`) passes validation
 - _[REJECT]_ The sidecar is from a higher slot than the sidecar's block's parent
 - _[REJECT]_ The current finalized_checkpoint is an ancestor of the sidecar's block -- i.e. `get_checkpoint_block(store, block_header.parent_root, store.finalized_checkpoint.epoch) == store.finalized_checkpoint.root`
 - _[REJECT]_ The sidecar's inclusion proof is valid as verified by `verify_chunk_inclusion_proof(chunk_sidecar)`
-- _[REJECT]_ The chunk respects the gas limit -- i.e. `chunk_sidecar.chunk.gas_used <= CHUNK_GAS_LIMIT`
-- _[REJECT]_ The chunk index matches -- i.e. `chunk_sidecar.chunk.index == chunk_sidecar.index`
-- _[REJECT]_ For non-last chunks, verify no withdrawals -- i.e. if `chunk_sidecar.index < len(beacon_block.body.chunk_roots) - 1`, then `len(chunk_sidecar.chunk.withdrawals) == 0`
-- _[REJECT]_ For the last chunk, verify withdrawals are present (unless none expected) -- i.e. if `chunk_sidecar.index == len(beacon_block.body.chunk_roots) - 1`, then `len(chunk_sidecar.chunk.withdrawals) > 0` or `get_expected_withdrawals(state) == []`
-- _[IGNORE]_ The sidecar is the first sidecar for the tuple `(block_header.slot, block_header.proposer_index, chunk_sidecar.index)` with valid header signature and inclusion proof
+- _[REJECT]_ The chunk respects the gas limit -- i.e. `chunk_sidecar.chunk.chunk_header.gas_used <= CHUNK_GAS_LIMIT`
+- _[REJECT]_ For non-terminal chunks, verify minimum fill -- i.e. if not last chunk, then `chunk_sidecar.chunk.chunk_header.gas_used >= CHUNK_GAS_LIMIT * MIN_CHUNK_FILL_RATIO`
+- _[REJECT]_ For non-last chunks, verify no withdrawals -- i.e. if `chunk_sidecar.chunk.chunk_header.index < len(beacon_block.body.chunk_roots) - 1`, then `len(chunk_sidecar.chunk.withdrawals) == 0`
+- _[REJECT]_ For the last chunk, verify withdrawals are present (unless none expected) -- i.e. if last chunk, then `len(chunk_sidecar.chunk.withdrawals) > 0` or `get_expected_withdrawals(state) == []`
+- _[IGNORE]_ The sidecar is the first sidecar for the tuple `(block_header.slot, block_header.proposer_index, chunk_sidecar.chunk.chunk_header.index)` with valid header signature and inclusion proof
 - _[REJECT]_ The sidecar is proposed by the expected `proposer_index` for the block's slot
 
 #### Chunk access list subnets  
@@ -105,23 +108,24 @@ The following validations MUST pass before forwarding the `chunk_sidecar` on the
 This topic is used to propagate chunk access list sidecars, where each chunk access list index maps to some `subnet_id`.
 
 ```python
-def compute_subnet_for_chunk_access_list_sidecar(cal_index: uint64) -> uint64:
-    return cal_index % CHUNK_ACCESS_LIST_SUBNET_COUNT
+def compute_subnet_for_chunk_access_list_sidecar(cal_index: uint8) -> uint64:
+    return cal_index % CHUNK_ACCESS_LIST_SUBNET_COUNT  # cal_index % 16
 ```
 
-The following validations MUST pass before forwarding the `cal_sidecar` on the network, assuming the alias `block_header = cal_sidecar.signed_block_header.message`:
+The following validations MUST pass before forwarding the `cal_sidecar` on the network, assuming the alias `block_header = cal_sidecar.cal_signature.message`:
 
-- _[REJECT]_ The sidecar's index is consistent with `MAX_CHUNKS_PER_BLOCK` -- i.e. `cal_sidecar.index < MAX_CHUNKS_PER_BLOCK`
-- _[REJECT]_ The sidecar is for the correct subnet -- i.e. `compute_subnet_for_chunk_access_list_sidecar(cal_sidecar.index) == subnet_id`
+- _[REJECT]_ The CAL index (derived from block structure) is consistent with `MAX_CHUNKS_PER_BLOCK`
+- _[REJECT]_ The sidecar is for the correct subnet based on its index in the block
 - _[IGNORE]_ The sidecar is not from a future slot (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. validate that `block_header.slot <= current_slot`
 - _[IGNORE]_ The sidecar is from a slot greater than the latest finalized slot -- i.e. validate that `block_header.slot > compute_start_slot_at_epoch(store.finalized_checkpoint.epoch)`
-- _[REJECT]_ The proposer signature of `cal_sidecar.signed_block_header` is valid with respect to the `block_header.proposer_index` pubkey
+- _[REJECT]_ The proposer signature of `cal_sidecar.cal_signature` is valid with respect to the `block_header.proposer_index` pubkey
 - _[IGNORE]_ The sidecar's block's parent (defined by `block_header.parent_root`) has been seen
 - _[REJECT]_ The sidecar's block's parent (defined by `block_header.parent_root`) passes validation
 - _[REJECT]_ The sidecar is from a higher slot than the sidecar's block's parent
 - _[REJECT]_ The current finalized_checkpoint is an ancestor of the sidecar's block -- i.e. `get_checkpoint_block(store, block_header.parent_root, store.finalized_checkpoint.epoch) == store.finalized_checkpoint.root`
 - _[REJECT]_ The sidecar's inclusion proof is valid as verified by `verify_chunk_access_list_inclusion_proof(cal_sidecar)`
-- _[IGNORE]_ The sidecar is the first sidecar for the tuple `(block_header.slot, block_header.proposer_index, cal_sidecar.index)` with valid header signature and inclusion proof
+- _[REJECT]_ The CAL size is within bounds -- i.e. `len(cal_sidecar.chunk_access_list) <= MAX_CHUNK_ACCESS_LIST_SIZE`
+- _[IGNORE]_ The sidecar is the first sidecar for the tuple `(block_header.slot, block_header.proposer_index, cal_index)` with valid header signature and inclusion proof
 - _[REJECT]_ The sidecar is proposed by the expected `proposer_index` for the block's slot
 
 ## The Req/Resp domain

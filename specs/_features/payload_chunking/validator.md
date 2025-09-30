@@ -29,6 +29,12 @@
 
 This document specifies the validator duties for payload chunking, building upon [Gloas validator duties](../../gloas/validator.md).
 
+Validators must handle two-phase validation:
+- **Phase 1**: Validate individual chunks as they arrive (streaming)
+- **Phase 2**: Verify complete state transition after all chunks received
+
+Validators MUST NOT attest until both phases complete successfully.
+
 ## Prerequisites
 
 This document assumes validators have access to an execution engine that supports payload chunking.
@@ -38,11 +44,11 @@ This document assumes validators have access to an execution engine that support
 ### `get_chunk_roots_from_payload_bid`
 
 ```python
-def compute_subnet_for_chunk_sidecar(chunk_index: uint64) -> uint64:
-    return chunk_index % EXECUTION_CHUNK_SUBNET_COUNT
+def compute_subnet_for_chunk_sidecar(chunk_index: uint8) -> uint64:
+    return chunk_index % EXECUTION_CHUNK_SUBNET_COUNT  # chunk_index % 16
 
-def compute_subnet_for_chunk_access_list_sidecar(cal_index: uint64) -> uint64:
-    return cal_index % CHUNK_ACCESS_LIST_SUBNET_COUNT
+def compute_subnet_for_chunk_access_list_sidecar(cal_index: uint8) -> uint64:
+    return cal_index % CHUNK_ACCESS_LIST_SUBNET_COUNT  # cal_index % 16
 ```
 
 
@@ -133,7 +139,7 @@ def prepare_beacon_block_body_local(
 
 ##### Chunk access lists
 
-Chunk access lists are RLP-encoded structures that enable independent execution of chunks. To execute chunk N, validators must have chunk access lists 0 through N-1.
+Chunk Access Lists (CALs) are required for chunk execution and propagate separately from chunks on dedicated gossip subnets. Validators must ensure all CALs are available before attestation.
 
 #### Chunk sidecars
 
@@ -165,9 +171,8 @@ def construct_chunk_sidecars(
         )
         
         sidecar = ExecutionChunkSidecar(
-            index=i,
             chunk=chunk,
-            signed_block_header=signed_block_header,
+            chunk_signature=signed_block_header,
             chunk_root_inclusion_proof=inclusion_proof,
         )
         sidecars.append(sidecar)
@@ -205,10 +210,9 @@ def construct_chunk_access_list_sidecars(
         )
         
         sidecar = ChunkAccessListSidecar(
-            index=i,
             chunk_access_list=cal,
-            signed_block_header=signed_block_header,
-            chunk_access_list_root_inclusion_proof=inclusion_proof,
+            cal_signature=signed_block_header,
+            cal_root_inclusion_proof=inclusion_proof,
         )
         sidecars.append(sidecar)
     
@@ -241,11 +245,12 @@ def publish_block_local_flow(
     gossip_publish("beacon_block", signed_block)
     
     for sidecar in chunk_sidecars:
-        subnet_id = compute_subnet_for_chunk_sidecar(sidecar.index)
+        chunk_index = sidecar.chunk.chunk_header.index
+        subnet_id = compute_subnet_for_chunk_sidecar(chunk_index)
         gossip_publish(f"execution_chunk_sidecar_{subnet_id}", sidecar)
     
-    for sidecar in cal_sidecars:
-        subnet_id = compute_subnet_for_chunk_access_list_sidecar(sidecar.index)
+    for i, sidecar in enumerate(cal_sidecars):
+        subnet_id = compute_subnet_for_chunk_access_list_sidecar(i)
         gossip_publish(f"chunk_access_list_sidecar_{subnet_id}", sidecar)
 ```
 
@@ -254,25 +259,44 @@ def publish_block_local_flow(
 
 ### Attestation data
 
-Validators must ensure all chunks and chunk access lists are available before including a block in their attestation.
-
+Validators MUST NOT attest to a block until both validation phases complete:
 
 ```python
 def is_block_available_for_attestation(
     store: Store,
     block_root: Root
 ) -> bool:
-    return is_payload_available(store, block_root)
+    """Check if block has passed two-phase validation
+    
+    Requirements:
+    1. Phase 1: All chunks individually validated
+    2. Phase 2: Complete state transition verified
+    3. Final state root matches block header commitment
+    """
+    # Check Phase 1: All chunks validated
+    if not all_chunks_validated(store, block_root):
+        return False
+    
+    # Check Phase 2: State transition verified
+    if not is_block_state_valid(store, block_root):
+        return False
+    
+    # Verify all chunks and CALs are available
+    if not is_payload_available(store, block_root):
+        return False
+    
+    return True
 ```
 
 ## Chunk and chunk access list gossip
 
 All validators must:
 
-1. Subscribe to all chunk subnets (`execution_chunk_sidecar_{0..7}`)
-2. Subscribe to all chunk access list subnets (`chunk_access_list_sidecar_{0..3}`)
+1. Subscribe to all chunk subnets (`execution_chunk_sidecar_{0..15}`)
+2. Subscribe to all chunk access list subnets (`chunk_access_list_sidecar_{0..15}`)
 3. Validate and forward valid sidecars according to the gossip rules
-4. Pass chunks and CALs to the execution engine immediately upon receipt for streaming validation
+4. Pass chunks to the execution engine immediately for Phase 1 validation
+5. Pass CALs to the execution engine for chunk processing
 
 When receiving sidecars:
 - Validate sidecars according to gossip rules

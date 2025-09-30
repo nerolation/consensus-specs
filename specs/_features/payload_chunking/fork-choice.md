@@ -26,11 +26,15 @@
 
 This document specifies the fork choice modifications for payload chunking, building upon [Gloas fork choice](../../gloas/fork-choice.md).
 
+The fork choice implements two-phase validation:
+- **Phase 1**: Individual chunk validation as they arrive (streaming)
+- **Phase 2**: Complete state transition verification after all chunks are received
+
 ## Custom types
 
 | Name | SSZ equivalent | Description |
 | ---- | -------------- | ----------- |
-| `ChunkIndex` | `uint64` | Index of a chunk within a block |
+| `ChunkIndex` | `uint8` | Index of a chunk within a block (0 to MAX_CHUNKS_PER_BLOCK-1) |
 
 ## Helpers
 
@@ -63,7 +67,9 @@ class Store:
     # New fields for payload chunking
     chunks: Dict[Tuple[Root, ChunkIndex], ExecutionChunk] = field(default_factory=dict)
     chunk_access_lists: Dict[Tuple[Root, ChunkIndex], ChunkAccessList] = field(default_factory=dict)
+    chunk_validation_status: Dict[Tuple[Root, ChunkIndex], bool] = field(default_factory=dict)  # Phase 1
     payload_chunk_availability: Dict[Root, bool] = field(default_factory=dict)
+    block_state_valid: Dict[Root, bool] = field(default_factory=dict)  # Phase 2
 ```
 
 ### `is_chunk_available`
@@ -131,11 +137,11 @@ def is_payload_available(store: Store, block_root: Root) -> bool:
 def notify_new_chunk(execution_engine: ExecutionEngine,
                      block_root: Root,
                      chunk: ExecutionChunk,
-                     parent_root: Root) -> bool:
-    return execution_engine.new_chunk(
-        block_root=block_root,
+                     parent_hash: Hash32) -> bool:
+    """Phase 1: Validate individual chunk as it arrives"""
+    return execution_engine.engine_newChunk(
         chunk=chunk,
-        parent_root=parent_root
+        parent_hash=parent_hash
     )
 ```
 
@@ -143,14 +149,14 @@ def notify_new_chunk(execution_engine: ExecutionEngine,
 
 ```python
 def notify_new_chunk_access_list(execution_engine: ExecutionEngine,
-                                 block_root: Root,
-                                 index: uint64,
-                                 chunk_access_list: ChunkAccessList) -> None:
-    # To execute chunk N, the EL requires CALs 0 through N-1
-    execution_engine.new_chunk_access_list(
-        block_root=block_root,
+                                 block_hash: Hash32,
+                                 index: uint8,
+                                 chunk_access_list: ChunkAccessList) -> bool:
+    """Provide CAL to execution engine for chunk processing"""
+    return execution_engine.engine_newChunkAccessList(
+        block_hash=block_hash,
         index=index,
-        chunk_access_list=chunk_access_list
+        cal=chunk_access_list
     )
 ```
 
@@ -158,12 +164,22 @@ def notify_new_chunk_access_list(execution_engine: ExecutionEngine,
 
 ```python
 def finalize_chunked_payload(execution_engine: ExecutionEngine,
-                            block_root: Root,
-                            expected_chunks: uint64) -> bool:
-    return execution_engine.finalize_payload(
-        block_root=block_root,
-        expected_chunks=expected_chunks
+                            block_hash: Hash32,
+                            expected_chunks: List[ChunkIndex],
+                            state_root: Hash32) -> bool:
+    """Phase 2: Verify complete state transition after all chunks received
+    
+    This verifies:
+    - State continuity between chunks
+    - Final state root matches the block header commitment
+    - All chunks executed successfully
+    """
+    payload_status = execution_engine.engine_finalizeChunkedPayload(
+        block_hash=block_hash,
+        expected_chunks=expected_chunks,
+        state_root=state_root
     )
+    return payload_status.status == "VALID"
 ```
 
 ## Handlers
@@ -175,41 +191,37 @@ def on_chunk(store: Store, chunk_sidecar: ExecutionChunkSidecar) -> None:
     # Verify the chunk sidecar signature and inclusion proof
     assert verify_chunk_inclusion_proof(chunk_sidecar)
     
-    # Verify chunk properties
-    assert chunk_sidecar.chunk.index == chunk_sidecar.index
-    assert chunk_sidecar.chunk.gas_used <= CHUNK_GAS_LIMIT
+    chunk = chunk_sidecar.chunk
+    chunk_index = chunk.chunk_header.index
     
-    block_root = chunk_sidecar.signed_block_header.message.body_root
+    # Verify chunk properties
+    assert chunk.chunk_header.gas_used <= CHUNK_GAS_LIMIT
+    
+    # Non-terminal chunks must meet minimum fill
+    if chunk_index < len(store.blocks[block_root].body.chunk_roots) - 1:
+        assert chunk.chunk_header.gas_used >= CHUNK_GAS_LIMIT * MIN_CHUNK_FILL_RATIO
+    
+    block_root = chunk_sidecar.chunk_signature.message.body_root
+    parent_root = chunk_sidecar.chunk_signature.message.parent_root
     
     # Store the chunk
-    store.chunks[(block_root, chunk_sidecar.index)] = chunk_sidecar.chunk
+    store.chunks[(block_root, chunk_index)] = chunk
     
-    execution_engine.notify_new_chunk(
+    # Phase 1: Validate chunk independently
+    parent_block = store.blocks[parent_root]
+    is_valid = notify_new_chunk(
+        execution_engine,
         block_root,
-        chunk_sidecar.chunk,
-        chunk_sidecar.signed_block_header.message.parent_root
+        chunk,
+        parent_block.body.execution_payload_header.block_hash
     )
     
-    # Check if all chunks are now available for this block
+    if is_valid:
+        store.chunk_validation_status[(block_root, chunk_index)] = True
+    
+    # Check if all chunks and CALs are now available
     if block_root in store.blocks:
-        block = store.blocks[block_root]
-        all_chunks_available = all(
-            is_chunk_available(store, block_root, i) 
-            for i in range(len(block.body.chunk_roots))
-        )
-        
-        if all_chunks_available:
-            # Check if we also have all chunk access lists
-            all_cals_available = all(
-                is_chunk_access_list_available(store, block_root, i)
-                for i in range(len(block.body.chunk_access_list_roots))
-            )
-            
-            if all_cals_available:
-                # Mark payload as available
-                store.payload_chunk_availability[block_root] = True
-                
-                finalize_payload_validation(store, block_root)
+        check_and_finalize_block(store, block_root)
 ```
 
 ### `on_chunk_access_list`
@@ -219,37 +231,32 @@ def on_chunk_access_list(store: Store, cal_sidecar: ChunkAccessListSidecar) -> N
     # Verify the CAL sidecar signature and inclusion proof
     assert verify_chunk_access_list_inclusion_proof(cal_sidecar)
     
-    block_root = cal_sidecar.signed_block_header.message.body_root
+    block_root = cal_sidecar.cal_signature.message.body_root
+    
+    # Determine CAL index from its position in the block
+    block = store.blocks[block_root]
+    cal_index = None
+    for i, root in enumerate(block.body.chunk_access_list_roots):
+        if hash_tree_root(cal_sidecar.chunk_access_list) == root:
+            cal_index = i
+            break
+    assert cal_index is not None
     
     # Store the chunk access list
-    store.chunk_access_lists[(block_root, cal_sidecar.index)] = cal_sidecar.chunk_access_list
+    store.chunk_access_lists[(block_root, cal_index)] = cal_sidecar.chunk_access_list
     
-    execution_engine.notify_new_chunk_access_list(
-        block_root,
-        cal_sidecar.index,
+    # Provide to execution engine
+    block = store.blocks[block_root]
+    notify_new_chunk_access_list(
+        execution_engine,
+        block.body.execution_payload_header.block_hash,
+        cal_index,
         cal_sidecar.chunk_access_list
     )
     
-    # Check if all chunk access lists are now available for this block
+    # Check if all chunks and CALs are now available
     if block_root in store.blocks:
-        block = store.blocks[block_root]
-        all_cals_available = all(
-            is_chunk_access_list_available(store, block_root, i)
-            for i in range(len(block.body.chunk_access_list_roots))
-        )
-        
-        if all_cals_available:
-            # Check if we also have all chunks
-            all_chunks_available = all(
-                is_chunk_available(store, block_root, i)
-                for i in range(len(block.body.chunk_roots))
-            )
-            
-            if all_chunks_available:
-                # Mark payload as available
-                store.payload_chunk_availability[block_root] = True
-                
-                finalize_payload_validation(store, block_root)
+        check_and_finalize_block(store, block_root)
 ```
 
 ### Modified `on_block`
@@ -279,30 +286,86 @@ def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
 ```
 
 ```python
-def finalize_payload_validation(store: Store, block_root: Root) -> None:
+def check_and_finalize_block(store: Store, block_root: Root) -> None:
+    """Check if block is ready for Phase 2 validation"""
     block = store.blocks[block_root]
-    is_valid = execution_engine.finalize_chunked_payload(
-        block_root,
-        len(block.body.chunk_roots)
+    num_chunks = len(block.body.chunk_roots)
+    
+    # Check Phase 1: All chunks individually validated
+    all_chunks_validated = all(
+        store.chunk_validation_status.get((block_root, i), False)
+        for i in range(num_chunks)
+    )
+    
+    # Check all CALs available
+    all_cals_available = all(
+        is_chunk_access_list_available(store, block_root, i)
+        for i in range(len(block.body.chunk_access_list_roots))
+    )
+    
+    if all_chunks_validated and all_cals_available:
+        store.payload_chunk_availability[block_root] = True
+        
+        # Phase 2: Verify complete state transition
+        finalize_block_validation(store, block_root)
+```
+
+```python
+def finalize_block_validation(store: Store, block_root: Root) -> None:
+    """Phase 2: Verify complete state transition"""
+    block = store.blocks[block_root]
+    
+    # Get expected chunks for validation
+    expected_chunks = list(range(len(block.body.chunk_roots)))
+    
+    # Phase 2: Verify final state matches header commitment
+    is_valid = finalize_chunked_payload(
+        execution_engine,
+        block.body.execution_payload_header.block_hash,
+        expected_chunks,
+        block.body.execution_payload_header.state_root
     )
     
     if is_valid:
+        store.block_state_valid[block_root] = True
         store.execution_payload_states[block_root] = True
         
         # Process block for fork choice if not already done
         if block_root not in store.block_states:
             process_block_for_fork_choice(store, block_root)
     else:
+        # Block failed Phase 2 validation
         del store.blocks[block_root]
         if block_root in store.payload_chunk_availability:
             del store.payload_chunk_availability[block_root]
+        # Clean up chunk data
+        for i in range(len(block.body.chunk_roots)):
+            if (block_root, i) in store.chunks:
+                del store.chunks[(block_root, i)]
+            if (block_root, i) in store.chunk_access_lists:
+                del store.chunk_access_lists[(block_root, i)]
 ```
 
 ```python
 def process_block_for_fork_choice(store: Store, block_root: Root) -> None:
+    """Process block after successful two-phase validation"""
     block = store.blocks[block_root]
     
     state = store.block_states[block.parent_root].copy()
     state_transition(state, signed_block, validate_result=False)
     store.block_states[block_root] = state
+```
+
+```python
+def is_block_valid_for_attestation(store: Store, block_root: Root) -> bool:
+    """Check if block has passed both validation phases"""
+    # Must have all chunks and CALs
+    if not store.payload_chunk_availability.get(block_root, False):
+        return False
+    
+    # Must have passed Phase 2 validation
+    if not store.block_state_valid.get(block_root, False):
+        return False
+    
+    return True
 ```
