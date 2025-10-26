@@ -62,8 +62,6 @@ Timing:
 
 ##### `chunk_access_list_sidecar_{subnet_id}`
 
-This topic is used to propagate chunk access list sidecars.
-
 - **Name**: `/eth2/` + `FORK_DIGEST` + `/chunk_access_list_sidecar_` + `subnet_id` + `/ssz_snappy`
 - **Subnet count**: `CAL_SUBNET_COUNT`
 - **Subnet assignment**: `subnet_id = cal_index % CAL_SUBNET_COUNT`

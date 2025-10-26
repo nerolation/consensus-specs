@@ -18,6 +18,7 @@ This specification defines the changes made to the beacon chain to support paylo
 | `MAX_CHUNKS_PER_BLOCK` | `uint8(16)` | Maximum chunks in a block |
 | `MIN_CHUNK_FILL_RATIO` | `0.5` | Non-terminal chunks must be ≥50% full |
 | `CHUNK_INCLUSION_PROOF_DEPTH` | `uint64(5)` | Merkle proof depth for chunk inclusion |
+| `MAX_CHUNK_ACCESS_LIST_SIZE` | `uint64(2**18)` | Maximum CAL size (256 KB) |
 
 ## Preset
 
@@ -35,13 +36,15 @@ This specification defines the changes made to the beacon chain to support paylo
 
 ```python
 class ExecutionChunkHeader(Container):
-    index: uint8                    # Position in block (0 to MAX_CHUNKS_PER_BLOCK-1)
-    parent_hash: Hash32            # Parent block the first chunk builds on top of
-    txs_root: Root                 # Merkle root of transactions
-    receipts_root: Root            # Merkle root of receipts
+    index: uint8                     # Position in block (0 to MAX_CHUNKS_PER_BLOCK-1)
+    parent_chunk_hash: Hash32        # Hash of the parent chunk (previous chunk or last chunk of prev slot)
+    timestamp: uint64                # Timestamp of chunk execution
+    txs_root: Root                   # Merkle root of transactions
+    receipts_root: Root             # Merkle root of receipts
     logs_bloom: ByteVector[BYTES_PER_LOGS_BLOOM]  # Bloom filter for logs
-    gas_used: uint64               # Gas consumed in chunk
-    withdrawals_root: Root         # Merkle root of withdrawals (if present)
+    gas_used: uint64                # Gas consumed in chunk
+    state_root: Root                # Post-execution state root
+    withdrawals_root: Root          # Merkle root of withdrawals (only for last chunk)
 ```
 
 #### `ExecutionChunk`
@@ -55,11 +58,9 @@ class ExecutionChunk(Container):
 
 #### `ChunkAccessList`
 
-The Chunk Access List is an opaque byte array containing RLP-encoded state diffs.
-
 ```python
 class ChunkAccessList(ByteList[MAX_CHUNK_ACCESS_LIST_SIZE]):
-    pass
+    pass  # RLP-encoded state diffs from chunk execution
 ```
 
 #### `ExecutionChunkSidecar`
@@ -90,6 +91,7 @@ class ChunkAccessListSidecar(Container):
 class ChunkExecutionResult(Container):
     status: uint8  # 0=VALID, 1=INVALID, 2=INSUFFICIENT_INFORMATION, 3=SYNCING
     chunk_index: uint8
+    chunk_hash: Hash32  # Hash of the executed chunk
     validation_error: ByteList[MAX_ERROR_SIZE]  # Error details if INVALID
     missing_cal_indices: List[uint8, MAX_CHUNKS_PER_BLOCK]  # Missing CALs if INSUFFICIENT_INFORMATION
     post_state_root: Root  # State root after chunk execution if VALID
@@ -203,10 +205,10 @@ class BeaconState(Container):
     execution_payload_availability: Bitvector[SLOTS_PER_HISTORICAL_ROOT]
     builder_pending_payments: List[BuilderPendingPayment, MAX_BUILDER_PENDING_PAYMENTS]
     builder_pending_withdrawals: List[BuilderPendingWithdrawal, MAX_BUILDER_PENDING_WITHDRAWALS]
-    latest_block_hash: Hash32
     latest_withdrawals_root: Root
     
     # New fields for chunking [New in EIP9999]
+    latest_chunk_hash: Hash32  # Hash of the last executed chunk (forms the chain)
     chunk_execution_status: List[ChunkExecutionResult, MAX_CHUNKS_PER_BLOCK]
     received_chunk_indices: Bitvector[MAX_CHUNKS_PER_BLOCK]
     received_cal_indices: Bitvector[MAX_CHUNKS_PER_BLOCK]
@@ -216,25 +218,33 @@ class BeaconState(Container):
 
 ### Chunk validation
 
+#### `compute_chunk_hash`
+
+```python
+def compute_chunk_hash(chunk: ExecutionChunk) -> Hash32:
+    """
+    Compute chunk hash for chain continuity.
+    """
+    return hash(
+        chunk.chunk_header.ssz_serialize() + 
+        hash_tree_root(chunk.transactions) +
+        hash_tree_root(chunk.withdrawals)
+    )
+```
+
 #### `validate_chunk_structure`
 
 ```python
 def validate_chunk_structure(chunk: ExecutionChunk, chunk_index: uint8) -> bool:
     """
-    Validate chunk structure and gas limits
+    Validate chunk gas limits and structure.
     """
-    # Check gas limit
     if chunk.chunk_header.gas_used > CHUNK_GAS_LIMIT:
         return False
-    
-    # Check index
     if chunk.chunk_header.index != chunk_index:
         return False
-    
-    # Withdrawals only in last chunk
     if len(chunk.withdrawals) > 0 and chunk_index != MAX_CHUNKS_PER_BLOCK - 1:
         return False
-    
     return True
 ```
 
@@ -243,39 +253,36 @@ def validate_chunk_structure(chunk: ExecutionChunk, chunk_index: uint8) -> bool:
 ```python
 def validate_chunk_fill_ratio(chunks: List[ExecutionChunk, MAX_CHUNKS_PER_BLOCK]) -> bool:
     """
-    Validate that non-terminal chunks meet minimum fill requirements
+    Non-terminal chunks must be ≥50% full or combined with next ≥ CHUNK_GAS_LIMIT.
     """
     for i in range(len(chunks) - 1):
         chunk = chunks[i]
         next_chunk = chunks[i + 1]
-        
-        # Non-terminal chunks must be at least 50% full OR
-        # their gas + next chunk's gas >= CHUNK_GAS_LIMIT
         if chunk.chunk_header.gas_used < MIN_CHUNK_FILL_RATIO * CHUNK_GAS_LIMIT:
-            combined_gas = chunk.chunk_header.gas_used + next_chunk.chunk_header.gas_used
-            if combined_gas < CHUNK_GAS_LIMIT:
+            if chunk.chunk_header.gas_used + next_chunk.chunk_header.gas_used < CHUNK_GAS_LIMIT:
                 return False
-    
     return True
 ```
 
-#### `compute_chunk_root`
+#### `validate_chunk_hash_chain`
 
 ```python
-def compute_chunk_root(chunk: ExecutionChunk) -> Root:
+def validate_chunk_hash_chain(
+    chunk: ExecutionChunk, 
+    parent_chunk_hash: Hash32,
+    chunk_index: uint8
+) -> bool:
     """
-    Compute the hash tree root of an execution chunk
+    Validate parent hash and index match.
     """
-    return hash_tree_root(chunk)
+    return (chunk.chunk_header.parent_chunk_hash == parent_chunk_hash and 
+            chunk.chunk_header.index == chunk_index)
 ```
 
 #### `compute_cal_root`
 
 ```python
 def compute_cal_root(cal: ChunkAccessList) -> Root:
-    """
-    Compute the hash tree root of a chunk access list
-    """
     return hash_tree_root(cal)
 ```
 

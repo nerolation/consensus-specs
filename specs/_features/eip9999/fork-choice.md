@@ -4,26 +4,23 @@
 
 ## Introduction
 
-This document specifies the modifications to the fork choice for EIP-9999 Payload Chunking, introducing two-phase validation for chunked payloads.
+This specification extends the Gloas fork choice to support streaming chunk execution with CAL-based state reconstruction.
 
 ## Custom types
 
 | Name | SSZ equivalent | Description |
 | - | - | - |
 | `ChunkStatus` | `uint8` | Status of chunk execution |
-| `BlockPhase` | `uint8` | Current phase of block validation |
 
 ## Constants
 
 | Name | Value | Description |
 | - | - | - |
-| `CHUNK_STATUS_PENDING` | `ChunkStatus(0)` | Chunk not yet executed |
-| `CHUNK_STATUS_VALID` | `ChunkStatus(1)` | Chunk successfully executed |
-| `CHUNK_STATUS_INVALID` | `ChunkStatus(2)` | Chunk execution failed |
-| `CHUNK_STATUS_SYNCING` | `ChunkStatus(3)` | Waiting for prerequisites |
-| `BLOCK_PHASE_CHUNKING` | `BlockPhase(0)` | Phase 1: Executing chunks |
-| `BLOCK_PHASE_FINALIZING` | `BlockPhase(1)` | Phase 2: Finalizing block |
-| `BLOCK_PHASE_COMPLETE` | `BlockPhase(2)` | Both phases complete |
+| `CHUNK_STATUS_PENDING` | `ChunkStatus(0)` | Not yet received |
+| `CHUNK_STATUS_WAITING` | `ChunkStatus(1)` | Waiting for CALs |
+| `CHUNK_STATUS_EXECUTING` | `ChunkStatus(2)` | Currently executing |
+| `CHUNK_STATUS_VALID` | `ChunkStatus(3)` | Successfully executed |
+| `CHUNK_STATUS_INVALID` | `ChunkStatus(4)` | Execution failed |
 
 ## Containers
 
@@ -32,217 +29,213 @@ This document specifies the modifications to the fork choice for EIP-9999 Payloa
 ```python
 @dataclass
 class Store(object):
-    # Existing Gloas fields
-    time: uint64
-    genesis_time: uint64
-    justified_checkpoint: Checkpoint
-    finalized_checkpoint: Checkpoint
-    unrealized_justified_checkpoint: Checkpoint
-    unrealized_finalized_checkpoint: Checkpoint
-    proposer_boost_root: Root
-    equivocating_indices: Set[ValidatorIndex]
-    blocks: Dict[Root, BeaconBlock] = field(default_factory=dict)
-    block_states: Dict[Root, BeaconState] = field(default_factory=dict)
-    checkpoint_states: Dict[Checkpoint, BeaconState] = field(default_factory=dict)
-    latest_messages: Dict[ValidatorIndex, LatestMessage] = field(default_factory=dict)
-    execution_payload_envelopes: Dict[Root, SignedExecutionPayloadEnvelope] = field(default_factory=dict)
+    # Existing Gloas fields unchanged
+    # ...
     
-    # New fields for chunking [New in EIP9999]
+    # Chunk and CAL storage [New in EIP9999]
     chunks: Dict[Tuple[Root, uint8], ExecutionChunk] = field(default_factory=dict)
+    chunk_hashes: Dict[Tuple[Root, uint8], Hash32] = field(default_factory=dict)
     chunk_access_lists: Dict[Tuple[Root, uint8], ChunkAccessList] = field(default_factory=dict)
-    chunk_execution_status: Dict[Tuple[Root, uint8], ChunkStatus] = field(default_factory=dict)
-    block_validation_phase: Dict[Root, BlockPhase] = field(default_factory=dict)
-    block_final_state_valid: Dict[Root, bool] = field(default_factory=dict)
+    chunk_status: Dict[Tuple[Root, uint8], ChunkStatus] = field(default_factory=dict)
+    
+    # Block finalization tracking
+    block_finalized: Dict[Root, bool] = field(default_factory=dict)
 ```
 
-### New containers
+## Streaming Execution
 
-#### `ChunkExecutionInfo`
+Chunks execute in sequence as CALs (state diffs) become available:
+- Chunk 0 executes on parent state → generates CAL 0
+- Chunk N applies CALs 0..N-1 to parent state → generates CAL N
+- Hash chain validated at finalization
 
-```python
-@dataclass
-class ChunkExecutionInfo(object):
-    chunk_index: uint8
-    status: ChunkStatus
-    post_state_root: Root
-    error_message: Optional[str]
-```
-
-## Fork choice handlers
-
-### Modified `on_block`
+### `on_block`
 
 ```python
 def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
     """
-    Modified to initiate two-phase validation for chunked blocks
+    Initialize chunk tracking for streaming validation.
     """
     block = signed_block.message
+    block_root = hash_tree_root(block)
     
     # Existing Gloas validation
     # ...
     
-    # Initialize block validation phase [New in EIP9999]
-    if is_eip9999_block(block):
-        store.block_validation_phase[hash_tree_root(block)] = BLOCK_PHASE_CHUNKING
-        
-        # Extract chunk commitments from bid
+    # Initialize chunk tracking [New in EIP9999]
+    if has_chunks(block):
         bid = block.body.signed_execution_payload_bid.message
-        for i, chunk_root in enumerate(bid.chunk_roots):
-            store.chunk_execution_status[(hash_tree_root(block), i)] = CHUNK_STATUS_PENDING
-    
-    # Continue with existing validation
-    # ...
+        for i in range(len(bid.chunk_roots)):
+            store.chunk_status[(block_root, i)] = CHUNK_STATUS_PENDING
+        store.block_finalized[block_root] = False
 ```
 
-### New `on_execution_chunk_sidecar`
+### `on_execution_chunk_sidecar`
 
 ```python
 def on_execution_chunk_sidecar(store: Store, sidecar: ExecutionChunkSidecar) -> None:
     """
-    Handle received chunk sidecar
+    Handle chunk arrival - execute if CAL prerequisites are available.
     """
     block_root = sidecar.block_root
     chunk_index = sidecar.chunk_index
     
-    # Verify block exists
+    # Validate sidecar structure and proof
     assert block_root in store.blocks
     block = store.blocks[block_root]
+    assert validate_chunk_sidecar(store, sidecar)
     
-    # Verify chunk commitment
-    bid = block.body.signed_execution_payload_bid.message
-    assert chunk_index < len(bid.chunk_roots)
+    # Store chunk and hash
+    chunk = sidecar.chunk
+    store.chunks[(block_root, chunk_index)] = chunk
+    store.chunk_hashes[(block_root, chunk_index)] = compute_chunk_hash(chunk)
     
-    # Verify inclusion proof
-    assert verify_merkle_proof(
-        leaf=compute_chunk_root(sidecar.chunk),
-        proof=sidecar.chunk_root_inclusion_proof,
-        depth=CHUNK_INCLUSION_PROOF_DEPTH,
-        index=chunk_index,
-        root=bid.chunk_roots[chunk_index]
-    )
-    
-    # Store chunk
-    store.chunks[(block_root, chunk_index)] = sidecar.chunk
-    
-    # Try to execute chunk if prerequisites are met
-    try_execute_chunk(store, block_root, chunk_index)
+    # Try to execute if prerequisites met
+    if chunk_index == 0:
+        # First chunk can execute immediately on parent state
+        execute_chunk_with_cals(store, block_root, 0, [])
+    else:
+        # Check if required CALs are available
+        store.chunk_status[(block_root, chunk_index)] = CHUNK_STATUS_WAITING
+        try_execute_chunk(store, block_root, chunk_index)
 ```
 
-### New `on_chunk_access_list_sidecar`
+### `on_chunk_access_list_sidecar`
 
 ```python
 def on_chunk_access_list_sidecar(store: Store, sidecar: ChunkAccessListSidecar) -> None:
     """
-    Handle received CAL sidecar
+    Handle CAL arrival - enables execution of dependent chunks.
     """
     block_root = sidecar.block_root
     cal_index = sidecar.chunk_index
     
-    # Verify block exists
-    assert block_root in store.blocks
-    block = store.blocks[block_root]
-    
-    # Verify CAL commitment
-    bid = block.body.signed_execution_payload_bid.message
-    assert cal_index < len(bid.chunk_access_list_roots)
-    
-    # Verify inclusion proof
-    assert verify_merkle_proof(
-        leaf=compute_cal_root(sidecar.chunk_access_list),
-        proof=sidecar.cal_root_inclusion_proof,
-        depth=CHUNK_INCLUSION_PROOF_DEPTH,
-        index=cal_index,
-        root=bid.chunk_access_list_roots[cal_index]
-    )
-    
-    # Store CAL
+    # Validate and store CAL
+    assert validate_cal_sidecar(store, sidecar)
     store.chunk_access_lists[(block_root, cal_index)] = sidecar.chunk_access_list
     
-    # Try to execute chunks that were waiting for this CAL
-    for chunk_idx in range(cal_index + 1, MAX_CHUNKS_PER_BLOCK):
-        if (block_root, chunk_idx) in store.chunks:
-            try_execute_chunk(store, block_root, chunk_idx)
+    # Try to execute chunks waiting for this CAL
+    # This creates the streaming cascade effect
+    for i in range(cal_index + 1, MAX_CHUNKS_PER_BLOCK):
+        if store.chunk_status.get((block_root, i)) == CHUNK_STATUS_WAITING:
+            try_execute_chunk(store, block_root, i)
 ```
 
-### New `try_execute_chunk`
+### `try_execute_chunk`
 
 ```python
 def try_execute_chunk(store: Store, block_root: Root, chunk_index: uint8) -> None:
     """
-    Attempt to execute a chunk if all prerequisites are met
+    Execute chunk if all required CALs are available.
     """
-    # Check if chunk is already executed
-    if store.chunk_execution_status.get((block_root, chunk_index), CHUNK_STATUS_PENDING) != CHUNK_STATUS_PENDING:
-        return
-    
-    # Check if chunk is available
+    # Check chunk is available
     if (block_root, chunk_index) not in store.chunks:
         return
     
-    # Check if all required CALs are available
+    # Gather required CALs (0 to chunk_index-1)
     required_cals = []
     for i in range(chunk_index):
         if (block_root, i) not in store.chunk_access_lists:
-            # Missing required CAL
-            store.chunk_execution_status[(block_root, chunk_index)] = CHUNK_STATUS_SYNCING
-            return
+            return  # CAL not available yet
         required_cals.append(store.chunk_access_lists[(block_root, i)])
     
-    # Execute chunk with CALs
-    chunk = store.chunks[(block_root, chunk_index)]
-    result = engine_execute_chunk_with_cals(
-        block_root,
-        chunk,
-        required_cals
-    )
-    
-    # Update status based on result
-    if result.status == "VALID":
-        store.chunk_execution_status[(block_root, chunk_index)] = CHUNK_STATUS_VALID
-        # Check if all chunks are now executed
-        check_block_finalization(store, block_root)
-    elif result.status == "INVALID":
-        store.chunk_execution_status[(block_root, chunk_index)] = CHUNK_STATUS_INVALID
-        # Mark entire block as invalid
-        mark_block_invalid(store, block_root)
-    else:
-        store.chunk_execution_status[(block_root, chunk_index)] = CHUNK_STATUS_SYNCING
+    # All prerequisites available - execute
+    execute_chunk_with_cals(store, block_root, chunk_index, required_cals)
 ```
 
-### New `check_block_finalization`
+### `execute_chunk_with_cals`
+
+```python
+def execute_chunk_with_cals(
+    store: Store,
+    block_root: Root,
+    chunk_index: uint8,
+    required_cals: List[ChunkAccessList]
+) -> None:
+    """
+    Execute chunk using CALs to reconstruct pre-state.
+    """
+    chunk = store.chunks[(block_root, chunk_index)]
+    
+    # Mark as executing
+    store.chunk_status[(block_root, chunk_index)] = CHUNK_STATUS_EXECUTING
+    
+    # Execute chunk with CALs for state reconstruction
+    # The EL applies CALs to parent state to get chunk's pre-state
+    result = engine_execute_chunk_with_cals(
+        beacon_block_root=block_root,
+        chunk=chunk,
+        required_cals=required_cals  # CALs 0..chunk_index-1
+    )
+    
+    if result.status == "VALID":
+        store.chunk_status[(block_root, chunk_index)] = CHUNK_STATUS_VALID
+        
+        # Store the generated CAL for this chunk
+        # This enables execution of the next chunk (streaming cascade)
+        store.chunk_access_lists[(block_root, chunk_index)] = result.chunk_access_list
+        
+        # Try to execute next chunk if available
+        if chunk_index + 1 < MAX_CHUNKS_PER_BLOCK:
+            if store.chunk_status.get((block_root, chunk_index + 1)) == CHUNK_STATUS_WAITING:
+                try_execute_chunk(store, block_root, chunk_index + 1)
+        
+        # Check if all chunks executed
+        check_block_finalization(store, block_root)
+    else:
+        store.chunk_status[(block_root, chunk_index)] = CHUNK_STATUS_INVALID
+        store.block_finalized[block_root] = False
+```
+
+### `check_block_finalization`
 
 ```python
 def check_block_finalization(store: Store, block_root: Root) -> None:
     """
-    Check if all chunks are executed and finalize the block
+    Finalize block after all chunks executed, validating hash chain.
     """
     block = store.blocks[block_root]
     bid = block.body.signed_execution_payload_bid.message
-    num_chunks = len(bid.chunk_roots)
     
-    # Check if all chunks are executed
-    for i in range(num_chunks):
-        status = store.chunk_execution_status.get((block_root, i), CHUNK_STATUS_PENDING)
-        if status != CHUNK_STATUS_VALID:
+    # Check all chunks are executed
+    for i in range(len(bid.chunk_roots)):
+        if store.chunk_status.get((block_root, i)) != CHUNK_STATUS_VALID:
             return  # Not all chunks executed yet
     
-    # All chunks executed, move to finalization phase
-    if store.block_validation_phase[block_root] == BLOCK_PHASE_CHUNKING:
-        store.block_validation_phase[block_root] = BLOCK_PHASE_FINALIZING
+    # Validate hash chain continuity
+    parent_state = store.block_states[block_root]
+    expected_parent_hash = parent_state.latest_chunk_hash
+    
+    chunk_hashes = []
+    for i in range(len(bid.chunk_roots)):
+        chunk = store.chunks[(block_root, i)]
+        chunk_hash = store.chunk_hashes[(block_root, i)]
+        chunk_hashes.append(chunk_hash)
         
-        # Send finalization request to EL
-        result = engine_finalize_block(
-            block_root,
-            block.state_root,
-            num_chunks
-        )
-        
-        if result.status == "VALID":
-            store.block_validation_phase[block_root] = BLOCK_PHASE_COMPLETE
-            store.block_final_state_valid[block_root] = True
+        # Validate parent chunk hash
+        if i == 0:
+            # First chunk points to previous slot's last chunk
+            if chunk.chunk_header.parent_chunk_hash != expected_parent_hash:
+                store.block_finalized[block_root] = False
+                return
         else:
-            mark_block_invalid(store, block_root)
+            # Subsequent chunks point to previous chunk
+            if chunk.chunk_header.parent_chunk_hash != chunk_hashes[i-1]:
+                store.block_finalized[block_root] = False
+                return
+    
+    # Finalize block with validated chunk chain
+    result = engine_finalize_block(
+        beacon_block_root=block_root,
+        expected_state_root=block.state_root,
+        chunk_hashes=chunk_hashes
+    )
+    
+    if result.status == "VALID":
+        store.block_finalized[block_root] = True
+        store.block_states[block_root].latest_chunk_hash = chunk_hashes[-1]
+    else:
+        store.block_finalized[block_root] = False
 ```
 
 ### Modified `get_head`
@@ -250,158 +243,46 @@ def check_block_finalization(store: Store, block_root: Root) -> None:
 ```python
 def get_head(store: Store) -> Root:
     """
-    Modified to only consider blocks that have completed both validation phases
+    Only consider finalized blocks for head selection.
     """
-    # Get all valid blocks
     blocks = get_filtered_block_tree(store)
     
-    # Filter to only include blocks with complete validation [Modified in EIP9999]
-    valid_blocks = {}
-    for block_root, block in blocks.items():
-        if is_eip9999_block(store.blocks[block_root]):
-            # Check if block has completed both phases
-            if store.block_validation_phase.get(block_root) == BLOCK_PHASE_COMPLETE:
-                if store.block_final_state_valid.get(block_root, False):
-                    valid_blocks[block_root] = block
-        else:
-            # Pre-EIP9999 blocks use existing validation
-            valid_blocks[block_root] = block
+    # Filter to finalized blocks [Modified in EIP9999]
+    valid_blocks = {
+        root: block for root, block in blocks.items()
+        if not has_chunks(store.blocks[root]) or 
+           store.block_finalized.get(root, False)
+    }
     
-    # Continue with existing head selection logic on valid_blocks
-    # ...
+    # Apply existing fork choice rules
+    return compute_head(store, valid_blocks)
 ```
 
-### Modified `on_attestation`
+## Engine API
 
-```python
-def on_attestation(store: Store, attestation: Attestation, is_from_block: bool = False) -> None:
-    """
-    Modified to consider chunk availability for payload attestations
-    """
-    # Existing validation
-    # ...
-    
-    # Check chunk availability for payload present attestations [New in EIP9999]
-    if attestation.data.index == 1:  # Payload present
-        block_root = attestation.data.beacon_block_root
-        
-        if is_eip9999_block(store.blocks[block_root]):
-            # Require at least Phase 1 started (some chunks received)
-            has_chunks = False
-            bid = store.blocks[block_root].body.signed_execution_payload_bid.message
-            for i in range(len(bid.chunk_roots)):
-                if (block_root, i) in store.chunks:
-                    has_chunks = True
-                    break
-            
-            if not has_chunks:
-                # Cannot attest to payload present without any chunks
-                return
-    
-    # Continue with existing logic
-    # ...
-```
-
-## Helper functions
-
-### New `is_eip9999_block`
-
-```python
-def is_eip9999_block(block: BeaconBlock) -> bool:
-    """
-    Check if a block uses EIP9999 chunking
-    """
-    if block.body.signed_execution_payload_bid is None:
-        return False
-    
-    bid = block.body.signed_execution_payload_bid.message
-    return len(bid.chunk_roots) > 0
-```
-
-### New `count_available_chunks`
-
-```python
-def count_available_chunks(store: Store, block_root: Root) -> uint64:
-    """
-    Count how many chunks are available for a block
-    """
-    block = store.blocks[block_root]
-    bid = block.body.signed_execution_payload_bid.message
-    count = 0
-    
-    for i in range(len(bid.chunk_roots)):
-        if (block_root, i) in store.chunks:
-            count += 1
-    
-    return count
-```
-
-### New `count_executed_chunks`
-
-```python
-def count_executed_chunks(store: Store, block_root: Root) -> uint64:
-    """
-    Count how many chunks have been successfully executed
-    """
-    block = store.blocks[block_root]
-    bid = block.body.signed_execution_payload_bid.message
-    count = 0
-    
-    for i in range(len(bid.chunk_roots)):
-        if store.chunk_execution_status.get((block_root, i)) == CHUNK_STATUS_VALID:
-            count += 1
-    
-    return count
-```
-
-### New `get_chunk_availability_percentage`
-
-```python
-def get_chunk_availability_percentage(store: Store, block_root: Root) -> uint64:
-    """
-    Return percentage of chunks available (0-100)
-    """
-    block = store.blocks[block_root]
-    bid = block.body.signed_execution_payload_bid.message
-    total_chunks = len(bid.chunk_roots)
-    
-    if total_chunks == 0:
-        return 100  # No chunks means fully available
-    
-    available = count_available_chunks(store, block_root)
-    return (available * 100) // total_chunks
-```
-
-## Engine API integration
-
-### New `engine_execute_chunk_with_cals`
+### `engine_execute_chunk_with_cals`
 
 ```python
 def engine_execute_chunk_with_cals(
-    block_hash: Hash32,
+    beacon_block_root: Root,
     chunk: ExecutionChunk,
-    required_cals: List[ChunkAccessList]
+    required_cals: List[ChunkAccessList]  # CALs 0..chunk.index-1
 ) -> ChunkExecutionResult:
     """
-    Send chunk with required CALs to execution layer for validation
+    Execute chunk by applying CALs to parent state, return generated CAL.
     """
-    # Implementation calls EL with chunk and CALs
-    # Returns execution result
-    pass
 ```
 
-### New `engine_finalize_block`
+### `engine_finalize_block`
 
 ```python
 def engine_finalize_block(
-    block_hash: Hash32,
+    beacon_block_root: Root,
     expected_state_root: Root,
-    total_chunks: uint8
+    chunk_hashes: List[Hash32]
 ) -> PayloadStatus:
     """
-    Request EL to finalize block after all chunks are executed
+    Verify final state after all chunks executed.
     """
-    # Implementation calls EL to finalize block
-    # Returns final validation status
-    pass
 ```
+

@@ -101,9 +101,9 @@ def upgrade_to_eip9999(pre: gloas.BeaconState) -> BeaconState:
         execution_payload_availability=pre.execution_payload_availability,
         builder_pending_payments=pre.builder_pending_payments,
         builder_pending_withdrawals=pre.builder_pending_withdrawals,
-        latest_block_hash=pre.latest_block_hash,
         latest_withdrawals_root=pre.latest_withdrawals_root,
         # New chunking fields [New in EIP9999]
+        latest_chunk_hash=pre.latest_block_hash,  # Convert: last block hash becomes first parent chunk hash
         chunk_execution_status=List[ChunkExecutionResult, MAX_CHUNKS_PER_BLOCK](),
         received_chunk_indices=Bitvector[MAX_CHUNKS_PER_BLOCK](),
         received_cal_indices=Bitvector[MAX_CHUNKS_PER_BLOCK]()
