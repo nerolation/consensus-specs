@@ -67,22 +67,22 @@ class ChunkAccessList(ByteList[MAX_CHUNK_ACCESS_LIST_SIZE]):
 
 ```python
 class ExecutionChunkSidecar(Container):
-    block_root: Root
+    slot: Slot                      # Slot this chunk belongs to
+    proposer_index: ValidatorIndex   # Proposer who created this chunk
     chunk_index: uint8
     chunk: ExecutionChunk
     chunk_signature: BLSSignature
-    chunk_root_inclusion_proof: Vector[Bytes32, CHUNK_INCLUSION_PROOF_DEPTH]
 ```
 
 #### `ChunkAccessListSidecar`
 
 ```python
 class ChunkAccessListSidecar(Container):
-    block_root: Root
+    slot: Slot                      # Slot this CAL belongs to
+    proposer_index: ValidatorIndex   # Proposer who created this CAL
     chunk_index: uint8
     chunk_access_list: ChunkAccessList
     cal_signature: BLSSignature
-    cal_root_inclusion_proof: Vector[Bytes32, CHUNK_INCLUSION_PROOF_DEPTH]
 ```
 
 #### `ChunkExecutionResult`
@@ -352,19 +352,13 @@ def process_operations(state: BeaconState, body: BeaconBlockBody) -> None:
 ```python
 def process_chunk_sidecar(state: BeaconState, sidecar: ExecutionChunkSidecar) -> None:
     """
-    Process a received chunk sidecar
+    Process a received chunk sidecar (can arrive before beacon block)
     """
-    # Verify inclusion proof
-    assert verify_merkle_proof(
-        leaf=compute_chunk_root(sidecar.chunk),
-        proof=sidecar.chunk_root_inclusion_proof,
-        depth=CHUNK_INCLUSION_PROOF_DEPTH,
-        index=sidecar.chunk_index,
-        root=state.latest_execution_payload_bid.chunk_roots[sidecar.chunk_index]
-    )
-    
     # Validate chunk structure
     assert validate_chunk_structure(sidecar.chunk, sidecar.chunk_index)
+    
+    # Validate proposer signature
+    assert validate_chunk_proposer_signature(sidecar)
     
     # Mark chunk as received
     mark_chunk_received(state, sidecar.chunk_index)
@@ -384,19 +378,79 @@ def process_chunk_sidecar(state: BeaconState, sidecar: ExecutionChunkSidecar) ->
 ```python
 def process_cal_sidecar(state: BeaconState, sidecar: ChunkAccessListSidecar) -> None:
     """
-    Process a received CAL sidecar
+    Process a received CAL sidecar (can arrive before beacon block)
     """
-    # Verify inclusion proof
-    assert verify_merkle_proof(
-        leaf=compute_cal_root(sidecar.chunk_access_list),
-        proof=sidecar.cal_root_inclusion_proof,
-        depth=CHUNK_INCLUSION_PROOF_DEPTH,
-        index=sidecar.chunk_index,
-        root=state.latest_execution_payload_bid.chunk_access_list_roots[sidecar.chunk_index]
-    )
+    # Validate proposer signature
+    assert validate_cal_proposer_signature(sidecar)
     
     # Mark CAL as received
     mark_cal_received(state, sidecar.chunk_index)
+```
+
+#### `validate_chunk_proposer_signature`
+
+```python
+def validate_chunk_proposer_signature(
+    sidecar: ExecutionChunkSidecar
+) -> bool:
+    """
+    Validate chunk was signed by the expected proposer for the slot
+    """
+    proposer = get_beacon_proposer_index_for_slot(sidecar.slot)
+    return proposer == sidecar.proposer_index and verify_signature(
+        sidecar.chunk_signature, 
+        compute_chunk_signing_root(sidecar.chunk),
+        get_proposer_pubkey(sidecar.proposer_index)
+    )
+```
+
+#### `validate_cal_proposer_signature`
+
+```python
+def validate_cal_proposer_signature(
+    sidecar: ChunkAccessListSidecar
+) -> bool:
+    """
+    Validate CAL was signed by the expected proposer for the slot
+    """
+    proposer = get_beacon_proposer_index_for_slot(sidecar.slot)
+    return proposer == sidecar.proposer_index and verify_signature(
+        sidecar.cal_signature,
+        compute_cal_signing_root(sidecar.chunk_access_list),
+        get_proposer_pubkey(sidecar.proposer_index)
+    )
+```
+
+#### `validate_chunk_commitment`
+
+```python
+def validate_chunk_commitment(
+    chunk: ExecutionChunk,
+    chunk_index: uint8,
+    bid: ExecutionPayloadBid
+) -> bool:
+    """
+    Validate chunk matches bid commitment (called when block arrives)
+    """
+    if chunk_index >= len(bid.chunk_roots):
+        return False
+    return compute_chunk_root(chunk) == bid.chunk_roots[chunk_index]
+```
+
+#### `validate_cal_commitment`
+
+```python
+def validate_cal_commitment(
+    cal: ChunkAccessList,
+    cal_index: uint8,
+    bid: ExecutionPayloadBid
+) -> bool:
+    """
+    Validate CAL matches bid commitment (called when block arrives)
+    """
+    if cal_index >= len(bid.chunk_access_list_roots):
+        return False
+    return compute_cal_root(cal) == bid.chunk_access_list_roots[cal_index]
 ```
 
 #### `can_execute_chunk`

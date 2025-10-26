@@ -19,6 +19,7 @@ The specification extends the Gloas networking protocol with new topics and mess
 | `MAX_REQUEST_CHUNKS` | `2**8` (256) | Maximum chunks in a single request |
 | `MAX_REQUEST_CALS` | `2**8` (256) | Maximum CALs in a single request |
 | `MAX_CHUNK_ACCESS_LIST_SIZE` | `2**20` (1 MB) | Maximum size of a CAL |
+| `CHUNK_GOSSIP_SLOT_TOLERANCE` | `4` | Slots chunks can be gossiped before/after current |
 
 ## The gossip domain: gossipsub
 
@@ -40,24 +41,25 @@ The `execution_chunk_sidecar_{subnet_id}` topic is used to propagate `ExecutionC
 
 ```python
 class ExecutionChunkSidecar(Container):
-    block_root: Root
+    slot: Slot
+    proposer_index: ValidatorIndex
     chunk_index: uint8
     chunk: ExecutionChunk
     chunk_signature: BLSSignature
-    chunk_root_inclusion_proof: Vector[Bytes32, CHUNK_INCLUSION_PROOF_DEPTH]
 ```
 
 Validation rules:
-- The sidecar's `block_root` must reference a known beacon block
+- The slot must be current or recent: `slot >= current_slot - CHUNK_GOSSIP_SLOT_TOLERANCE`
+- The proposer must be valid for the slot
 - The chunk index must be within bounds: `chunk_index < MAX_CHUNKS_PER_BLOCK`
 - The subnet must match: `chunk_index % CHUNK_SUBNET_COUNT == subnet_id`
-- The inclusion proof must be valid against the bid's chunk commitments
 - The chunk structure must be valid (gas limits, transaction integrity)
-- The chunk signature must be valid from the builder
+- The chunk signature must be valid from the proposer
+- If beacon block exists, validate chunk commitment matches
 
 Timing:
-- Chunks MAY be published as soon as the beacon block is seen
-- Chunks SHOULD be published within 2 seconds of the slot start
+- Chunks MAY be published before the beacon block
+- Chunks SHOULD be published within 1 second of the slot start
 - Chunks MUST NOT be propagated more than `SECONDS_PER_SLOT` after the slot start
 
 ##### `chunk_access_list_sidecar_{subnet_id}`
@@ -70,24 +72,25 @@ The `chunk_access_list_sidecar_{subnet_id}` topic is used to propagate `ChunkAcc
 
 ```python
 class ChunkAccessListSidecar(Container):
-    block_root: Root
+    slot: Slot
+    proposer_index: ValidatorIndex
     chunk_index: uint8
     chunk_access_list: ChunkAccessList
     cal_signature: BLSSignature
-    cal_root_inclusion_proof: Vector[Bytes32, CHUNK_INCLUSION_PROOF_DEPTH]
 ```
 
 Validation rules:
-- The sidecar's `block_root` must reference a known beacon block
+- The slot must be current or recent: `slot >= current_slot - CHUNK_GOSSIP_SLOT_TOLERANCE`
+- The proposer must be valid for the slot
 - The chunk index must be within bounds: `chunk_index < MAX_CHUNKS_PER_BLOCK`
 - The subnet must match: `chunk_index % CAL_SUBNET_COUNT == subnet_id`
-- The inclusion proof must be valid against the bid's CAL commitments
 - The CAL size must not exceed `MAX_CHUNK_ACCESS_LIST_SIZE`
-- The CAL signature must be valid from the builder
+- The CAL signature must be valid from the proposer
+- If beacon block exists, validate CAL commitment matches
 
 Timing:
-- CALs MAY be published as soon as the chunk is executed
-- CALs SHOULD be published within 3 seconds of the slot start
+- CALs MAY be published as soon as the chunk is executed (even before beacon block)
+- CALs SHOULD be published within 2 seconds of the slot start
 - CALs MUST NOT be propagated more than `SECONDS_PER_SLOT` after the slot start
 
 ### Attestation subnets
@@ -106,11 +109,11 @@ def validate_attestation_with_chunks(attestation: Attestation, state: BeaconStat
     
     # Check chunk availability if attesting to payload present
     if attestation.data.index == 1:  # Payload present
-        block_root = attestation.data.beacon_block_root
-        bid = get_bid_for_block(state, block_root)
+        slot = attestation.data.slot
+        proposer = get_beacon_proposer_index(state, slot)
         
-        # Require at least one chunk to be available
-        chunks_available = count_available_chunks(state, block_root)
+        # Count chunks available (may be orphans or confirmed)
+        chunks_available = count_available_chunks_for_slot_proposer(state, slot, proposer)
         if chunks_available == 0:
             return False
     

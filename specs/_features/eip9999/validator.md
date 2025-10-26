@@ -38,10 +38,12 @@ When proposing with EIP9999 active, proposers must:
 
 #### Publishing chunks and CALs
 
-After beacon block publication, proposers/builders must:
-1. Publish chunk sidecars to appropriate subnets (`chunk_index % CHUNK_SUBNET_COUNT`)
-2. Publish CAL sidecars to appropriate subnets (`cal_index % CAL_SUBNET_COUNT`)
-3. Include valid inclusion proofs and signatures
+Proposers/builders must:
+1. Publish chunk sidecars immediately (can be before beacon block)
+2. Use slot and proposer_index for identification
+3. Route to appropriate subnets (`chunk_index % CHUNK_SUBNET_COUNT`)
+4. Publish CALs as chunks execute (`cal_index % CAL_SUBNET_COUNT`)
+5. Include valid proposer signatures
 
 ### Chunk and CAL validation
 

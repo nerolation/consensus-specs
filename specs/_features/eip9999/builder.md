@@ -54,9 +54,11 @@ CALs must contain:
 #### Optimal chunk and CAL publishing
 
 Publishing order:
-1. Publish chunks immediately after block
-2. Generate and publish CALs as chunks execute
-3. Enable cascading execution by timely CAL release
+1. Publish chunks immediately (before beacon block for fastest execution)
+2. Use slot and proposer_index for identification
+3. Generate and publish CALs as chunks execute
+4. Enable cascading execution by timely CAL release
+5. Beacon block published with chunk/CAL commitments for validation
 
 ### Builder selection
 
