@@ -22,6 +22,7 @@ from .helpers.constants import (
     CAPELLA,
     DENEB,
     EIP8025,
+    EIP8146,
     ELECTRA,
     FULU,
     GLOAS,
@@ -725,6 +726,7 @@ with_fulu_and_later = with_all_phases_from(FULU, all_phases=ALLOWED_TEST_RUNNER_
 with_gloas_and_later = with_all_phases_from(GLOAS, all_phases=ALLOWED_TEST_RUNNER_FORKS)
 with_heze_and_later = with_all_phases_from(HEZE, all_phases=ALLOWED_TEST_RUNNER_FORKS)
 with_eip8025_and_later = with_all_phases_from(EIP8025, all_phases=ALLOWED_TEST_RUNNER_FORKS)
+with_eip8146_and_later = with_all_phases_from(EIP8146, all_phases=ALLOWED_TEST_RUNNER_FORKS)
 
 with_bellatrix_only = with_phases([BELLATRIX])
 
